@@ -1,60 +1,39 @@
 mod astral_wfp;
-
+mod nt;
 use windows::core::*;
-use astral_wfp::WfpController;
+
+use crate::nt::get_nt_path;
 
 
 
 fn main() -> Result<()> {
     use astral_wfp::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    let path = r"C:\program files (x86)\microsoft\edge\application\msedge.exe";
+    let nt_path = match get_nt_path(path) {
+        Some(path) => path,
+        None => {
+            eprintln!("转换失败");
+            return Ok(());
+        }
+    };
 
+    let nt_path: &'static str = Box::leak(nt_path.into_boxed_str());
     // 创建WFP控制器实例
     let mut wfp_controller = WfpController::new()?;
 
     // 初始化WFP引擎
     wfp_controller.initialize()?;
 
-    // 设置要控制的应用程序路径
-    let app_path = r"\device\harddiskvolume3\users\kevin\appdata\roaming\.minecraft\runtime\java-runtime-delta\bin\javaw.exe";
-    println!("🎯 目标应用程序: {}", app_path);
-
-
-    println!("\n🔧 添加高级过滤器规则...");
+    println!("🎯 目标应用程序: {:?}", nt_path);
+    println!("\n🔧 添加禁止所有网络连接的规则...");
     let advanced_rules = vec![
- 
-        
-        // 阻止10.126.126.1/12网段的出站连接
-        FilterRule::new("阻止10.126.126.1/12出站TCP")
-            .app_path(app_path)
-            .local_ip_cidr("10.126.126.1/12").unwrap()
-            .protocol(Protocol::Tcp)
-            .direction(Direction::Outbound)
-            .action(FilterAction::Block),
-        
-        FilterRule::new("阻止10.126.126.1/12出站UDP")
-            .app_path(app_path)
-            .local_ip_cidr("10.126.126.1/12").unwrap()
-            .protocol(Protocol::Udp)
-            .direction(Direction::Outbound)
-            .action(FilterAction::Block),
-        
-        // 阻止来自10.126.126.1/12网段的入站连接
-        FilterRule::new("阻止10.126.126.1/12入站TCP")
-            .app_path(app_path)
-            .local_ip_cidr("10.126.126.1/12").unwrap()
-            .protocol(Protocol::Tcp)
-            .direction(Direction::Inbound)
-            .action(FilterAction::Block),
-        
-        FilterRule::new("阻止10.126.126.1/12入站UDP")
-            .app_path(app_path)
-            .local_ip_cidr("10.126.126.1/12").unwrap()
-            .protocol(Protocol::Udp)
-            .direction(Direction::Inbound)
+        // 禁止 Chrome 的所有网络连接（入站和出站，所有协议、所有端口、所有 IP）
+        FilterRule::new("禁止 Chrome 所有网络连接")
+            .app_path(nt_path)
+            .direction(Direction::Both)
             .action(FilterAction::Block),
     ];
-    
+
     wfp_controller.add_advanced_filters(&advanced_rules)?;
 
     // 运行控制器
@@ -64,5 +43,9 @@ fn main() -> Result<()> {
     wfp_controller.cleanup()?;
 
     println!("\n✅ 程序已安全退出");
+    // 添加这行代码，等待用户按下回车键
+    println!("按 Enter 键退出...");
+    let mut buffer = String::new();
+    std::io::stdin().read_line(&mut buffer).unwrap();
     Ok(())
 }
