@@ -1,12 +1,11 @@
 mod astral_wfp;
 mod nt;
 use windows::core::*;
-
 use crate::nt::get_nt_path;
+use tokio::io::{self, AsyncBufReadExt};
 
 
-
-fn main() -> Result<()> {
+async fn jjk() -> windows::core::Result<()> {
     use astral_wfp::*;
     let path = r"C:\program files (x86)\microsoft\edge\application\msedge.exe";
     let nt_path = match get_nt_path(path) {
@@ -36,16 +35,19 @@ fn main() -> Result<()> {
 
     wfp_controller.add_advanced_filters(&advanced_rules)?;
 
-    // 运行控制器
-    wfp_controller.run()?;
+    Ok(())
+}
+#[tokio::main]
+async fn main() -> Result<()> {
+    
+    tokio::spawn(async {
+        if let Err(e) = jjk().await {
+            eprintln!("任务执行出错: {:?}", e);
+        }
+    });
+let mut stdin = io::BufReader::new(io::stdin()).lines();
+println!("按回车键退出程序...");
+let _ = stdin.next_line().await;
 
-    // 清理资源
-    wfp_controller.cleanup()?;
-
-    println!("\n✅ 程序已安全退出");
-    // 添加这行代码，等待用户按下回车键
-    println!("按 Enter 键退出...");
-    let mut buffer = String::new();
-    std::io::stdin().read_line(&mut buffer).unwrap();
     Ok(())
 }
