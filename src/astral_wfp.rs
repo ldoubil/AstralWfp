@@ -353,16 +353,7 @@ impl WfpController {
         layers
     }
 
-    // 等待用户输入并运行
-    pub fn run(&self) -> Result<()> {
-        println!("📊 过滤器正在运行...");
-        println!("\n按 Enter 键停止并退出\n");
 
-        // 等待用户输入
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        Ok(())
-    }
 
     // 清理过滤器
     pub fn cleanup(&mut self) -> Result<()> {
