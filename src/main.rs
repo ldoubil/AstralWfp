@@ -27,11 +27,11 @@ fn main() -> Result<()> {
     println!("🎯 目标应用程序: {:?}", nt_path);
     println!("\n🔧 添加禁止所有网络连接的规则...");
     let advanced_rules = vec![
-        // 禁止 Chrome 的所有网络连接（入站和出站，所有协议、所有端口、所有 IP）
-        FilterRule::new("禁止 Chrome 所有网络连接")
-            .app_path(nt_path)
-            .direction(Direction::Both)
-            .action(FilterAction::Block),
+        // 阻止所有IPv4连接
+        FilterRule::new("禁止 Chrome IPv4 访问")            .app_path(nt_path)
+            .remote_ip("192.168.31.1")  // 修正为正确的 IP 地址格式
+            .direction(Direction::Both)   // 明确指定方向
+            .action(FilterAction::Block)  // 明确指定动作
     ];
 
     wfp_controller.add_advanced_filters(&advanced_rules)?;

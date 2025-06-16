@@ -87,18 +87,17 @@ static mut EFFECTIVE_WEIGHT_VALUE: u64 = 0;
 
 // 过滤规则结构体
 #[derive(Debug, Clone)]
+// 过滤规则结构体
 pub struct FilterRule {
-    pub name: String,
-    pub app_path: Option<String>,
-    pub local_ip: Option<IpAddr>,
-    pub remote_ip: Option<IpAddr>,
-    pub local_ip_network: Option<IpNetwork>,
-    pub remote_ip_network: Option<IpNetwork>,
-    pub local_port: Option<u16>,
-    pub remote_port: Option<u16>,
-    pub protocol: Option<Protocol>,
-    pub direction: Direction,
-    pub action: FilterAction,
+    pub name: String,                        // 规则名称
+    pub app_path: Option<String>,            // 应用程序路径（可选）
+    pub local: Option<String>,    // 本地IP地址/网段，格式如: "192.168.1.1" 或 "192.168.1.0/24"（可选）
+    pub remote: Option<String>,   // 远程IP地址/网段，格式如: "8.8.8.8" 或 "8.8.0.0/16"（可选）
+    pub local_port: Option<u16>,             // 本地端口（可选）
+    pub remote_port: Option<u16>,            // 远程端口（可选）
+    pub protocol: Option<Protocol>,          // 协议类型（可选）
+    pub direction: Direction,                // 流量方向
+    pub action: FilterAction,                // 过滤动作（允许/阻止）
 }
 
 #[derive(Debug, Clone)]
@@ -126,10 +125,8 @@ impl FilterRule {
         Self {
             name: name.to_string(),
             app_path: None,
-            local_ip: None,
-            remote_ip: None,
-            local_ip_network: None,
-            remote_ip_network: None,
+            local: None,
+            remote: None,
             local_port: None,
             remote_port: None,
             protocol: None,
@@ -143,35 +140,16 @@ impl FilterRule {
         self
     }
 
-    pub fn local_ip(mut self, ip: IpAddr) -> Self {
-        self.local_ip = Some(ip);
+    pub fn local_ip(mut self, ip: impl ToString) -> Self {
+        self.local = Some(ip.to_string());
         self
     }
 
-    pub fn remote_ip(mut self, ip: IpAddr) -> Self {
-        self.remote_ip = Some(ip);
+    pub fn remote_ip(mut self, ip: impl ToString) -> Self {
+        self.remote = Some(ip.to_string());
         self
     }
 
-    pub fn local_ip_network(mut self, network: IpNetwork) -> Self {
-        self.local_ip_network = Some(network);
-        self
-    }
-
-    pub fn remote_ip_network(mut self, network: IpNetwork) -> Self {
-        self.remote_ip_network = Some(network);
-        self
-    }
-
-    pub fn local_ip_cidr(mut self, cidr: &str) -> std::result::Result<Self, String> {
-        self.local_ip_network = Some(IpNetwork::from_cidr(cidr)?);
-        Ok(self)
-    }
-
-    pub fn remote_ip_cidr(mut self, cidr: &str) -> std::result::Result<Self, String> {
-        self.remote_ip_network = Some(IpNetwork::from_cidr(cidr)?);
-        Ok(self)
-    }
 
     pub fn local_port(mut self, port: u16) -> Self {
         self.local_port = Some(port);
@@ -196,6 +174,37 @@ impl FilterRule {
     pub fn action(mut self, action: FilterAction) -> Self {
         self.action = action;
         self
+    }
+
+    fn validate_ip(&self, ip: &IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(ipv4) => {
+                let octets = ipv4.octets();
+                // 检查是否是有效的私有网络地址
+                match octets[0] {
+                    10 => true,  // 10.0.0.0/8
+                    172 => (16..=31).contains(&octets[1]),  // 172.16.0.0/12
+                    192 => octets[1] == 168,  // 192.168.0.0/16
+                    // 对于公网 IP，这里可以添加其他验证规则
+                    _ => true  // 暂时允许其他地址，可以根据需求修改
+                }
+            },
+            IpAddr::V6(_) => true  // IPv6 地址验证逻辑
+        }
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        // 验证远程 IP
+        if let Some(remote) = &self.remote {
+            if let Ok(ip) = remote.parse::<IpAddr>() {
+                if !self.validate_ip(&ip) {
+                    return Err(format!("无效的远程 IP 地址: {}", remote));
+                }
+            } else {
+                return Err(format!("无法解析的 IP 地址格式: {}", remote));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -271,6 +280,12 @@ impl WfpController {
             let mut added_count = 0;
             
             for rule in rules {
+                // 验证规则
+                if let Err(e) = rule.validate() {
+                    println!("❌ 规则验证失败: {}", e);
+                    continue;
+                }
+                
                 // 根据方向和IP版本确定需要的层
                 let layers = self.get_layers_for_rule(rule);
                 
@@ -301,8 +316,8 @@ impl WfpController {
         let mut layers = Vec::new();
         
         // 根据IP地址类型和方向确定层
-        let is_ipv6 = rule.local_ip.map_or(false, |ip| ip.is_ipv6()) || 
-                     rule.remote_ip.map_or(false, |ip| ip.is_ipv6());
+        let is_ipv6 = rule.local.as_ref().map_or(false, |ip| ip.contains(":")) || 
+                     rule.remote.as_ref().map_or(false, |ip| ip.contains(":"));
         
         match rule.direction {
             Direction::Outbound => {
@@ -405,7 +420,7 @@ impl WfpController {
         let mut conditions = Vec::new();
         
         // 添加应用程序路径条件
-        let mut app_id_data = None; // 变量前加下划线表示未使用
+        let mut _app_id_data = None;
         if let Some(app_path) = &rule.app_path {
             let appid_utf16: Vec<u16> = app_path
                 .encode_utf16()
@@ -428,133 +443,180 @@ impl WfpController {
                 },
             });
             
-            app_id_data = Some((appid_utf16, app_id));
+            _app_id_data = Some((appid_utf16, app_id));
             println!("✓ APP_ID条件已添加到过滤器: {}", app_path);
         }
         
-        // 添加本地IP条件
-        let mut _local_ip_data: Option<FWP_BYTE_ARRAY16> = None; // 变量前加下划线表示未使用
-        if let Some(local_ip) = rule.local_ip {
-            match local_ip {
-                IpAddr::V4(ipv4) => {
-                    let ip_bytes = ipv4.octets();
-                    let ip_value = u32::from_be_bytes(ip_bytes);
-                    
-                    conditions.push(FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_LOCAL_ADDRESS,
-                        matchType: FWP_MATCH_EQUAL,
-                        conditionValue: FWP_CONDITION_VALUE0 {
-                            r#type: FWP_UINT32,
-                            Anonymous: FWP_CONDITION_VALUE0_0 {
-                                uint32: ip_value,
+        // 添加本地IP/网段条件
+        if let Some(local) = &rule.local {
+            if let Ok(ip) = local.parse::<IpAddr>() {
+                match ip {
+                    IpAddr::V4(ipv4) => {
+                        let ip_bytes = ipv4.octets();
+                        let ip_value = u32::from_be_bytes(ip_bytes);
+                        
+                        conditions.push(FWPM_FILTER_CONDITION0 {
+                            fieldKey: FWPM_CONDITION_IP_LOCAL_ADDRESS,
+                            matchType: FWP_MATCH_EQUAL,
+                            conditionValue: FWP_CONDITION_VALUE0 {
+                                r#type: FWP_UINT32,
+                                Anonymous: FWP_CONDITION_VALUE0_0 {
+                                    uint32: ip_value,
+                                },
                             },
-                        },
-                    });
-                    println!("✓ 本地IPv4地址条件已添加: {}", ipv4);
-                },
-                IpAddr::V6(ipv6) => {
-                    let ip_bytes = ipv6.octets();
-                    let byte_array = FWP_BYTE_ARRAY16 {
-                        byteArray16: ip_bytes,
-                    };
-                    
-                    conditions.push(FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_LOCAL_ADDRESS,
-                        matchType: FWP_MATCH_EQUAL,
-                        conditionValue: FWP_CONDITION_VALUE0 {
-                            r#type: FWP_BYTE_ARRAY16_TYPE,
-                            Anonymous: FWP_CONDITION_VALUE0_0 {
-                                byteArray16: &byte_array as *const _ as *mut _,
+                        });
+                        println!("✓ 本地IPv4地址条件已添加: {}", ipv4);
+                    },
+                    IpAddr::V6(ipv6) => {
+                        let ip_bytes = ipv6.octets();
+                        let byte_array = FWP_BYTE_ARRAY16 {
+                            byteArray16: ip_bytes,
+                        };
+                        
+                        conditions.push(FWPM_FILTER_CONDITION0 {
+                            fieldKey: FWPM_CONDITION_IP_LOCAL_ADDRESS,
+                            matchType: FWP_MATCH_EQUAL,
+                            conditionValue: FWP_CONDITION_VALUE0 {
+                                r#type: FWP_BYTE_ARRAY16_TYPE,
+                                Anonymous: FWP_CONDITION_VALUE0_0 {
+                                    byteArray16: &byte_array as *const _ as *mut _,
+                                },
                             },
-                        },
-                    });
-                    let local_ip_data = Some(byte_array);
-                    println!("✓ 本地IPv6地址条件已添加: {}", ipv6);
+                        });
+                        println!("✓ 本地IPv6地址条件已添加: {}", ipv6);
+                    }
+                }
+            } else if let Ok(network) = IpNetwork::from_cidr(local) {
+                match network.ip {
+                    IpAddr::V4(network_ip) => {
+                        let network_bytes = network_ip.octets();
+                        // 使用安全的掩码计算方式
+                        let mask = if network.prefix_len == 0 {
+                            0u32 // 对于 0.0.0.0/0，掩码为全0
+                        } else if network.prefix_len == 32 {
+                            u32::MAX // 对于单个IP地址，掩码为全1
+                        } else {
+                            !((1u32 << (32 - network.prefix_len)) - 1)
+                        };
+                        let network_addr = u32::from_be_bytes(network_bytes) & mask;
+                        
+                        let range = FWP_RANGE0 {
+                            valueLow: FWP_VALUE0 {
+                                r#type: FWP_UINT32,
+                                Anonymous: FWP_VALUE0_0 {
+                                    uint32: network_addr,
+                                },
+                            },
+                            valueHigh: FWP_VALUE0 {
+                                r#type: FWP_UINT32,
+                                Anonymous: FWP_VALUE0_0 {
+                                    uint32: network_addr | !mask,
+                                },
+                            },
+                        };
+                        
+                        conditions.push(FWPM_FILTER_CONDITION0 {
+                            fieldKey: FWPM_CONDITION_IP_LOCAL_ADDRESS,
+                            matchType: FWP_MATCH_RANGE,
+                            conditionValue: FWP_CONDITION_VALUE0 {
+                                r#type: FWP_RANGE_TYPE,
+                                Anonymous: FWP_CONDITION_VALUE0_0 {
+                                    rangeValue: &range as *const _ as *mut _,
+                                },
+                            },
+                        });
+                        println!("✓ 本地IPv4网段条件已添加: {}/{}", network_ip, network.prefix_len);
+                    },
+                    IpAddr::V6(_) => {
+                        println!("⚠️ IPv6网段过滤暂不支持，将跳过此条件");
+                    }
                 }
             }
         }
         
-        // 添加远程IP条件
-        let mut remote_ip_data = None; // 变量前加下划线表示未使用
-        if let Some(remote_ip) = rule.remote_ip {
-            match remote_ip {
-                IpAddr::V4(ipv4) => {
-                    let ip_bytes = ipv4.octets();
-                    let ip_value = u32::from_be_bytes(ip_bytes);
-                    
-                    conditions.push(FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
-                        matchType: FWP_MATCH_EQUAL,
-                        conditionValue: FWP_CONDITION_VALUE0 {
-                            r#type: FWP_UINT32,
-                            Anonymous: FWP_CONDITION_VALUE0_0 {
-                                uint32: ip_value,
+        // 添加远程IP/网段条件
+        if let Some(remote) = &rule.remote {
+            if let Ok(ip) = remote.parse::<IpAddr>() {
+                match ip {
+                    IpAddr::V4(ipv4) => {
+                        let ip_bytes = ipv4.octets();
+                        let ip_value = u32::from_be_bytes(ip_bytes);
+                        
+                        conditions.push(FWPM_FILTER_CONDITION0 {
+                            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                            matchType: FWP_MATCH_EQUAL,
+                            conditionValue: FWP_CONDITION_VALUE0 {
+                                r#type: FWP_UINT32,
+                                Anonymous: FWP_CONDITION_VALUE0_0 {
+                                    uint32: ip_value,
+                                },
                             },
-                        },
-                    });
-                    println!("✓ 远程IPv4地址条件已添加: {}", ipv4);
-                },
-                IpAddr::V6(ipv6) => {
-                    let ip_bytes = ipv6.octets();
-                    let byte_array = FWP_BYTE_ARRAY16 {
-                        byteArray16: ip_bytes,
-                    };
-                    
-                    conditions.push(FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
-                        matchType: FWP_MATCH_EQUAL,
-                        conditionValue: FWP_CONDITION_VALUE0 {
-                            r#type: FWP_BYTE_ARRAY16_TYPE,
-                            Anonymous: FWP_CONDITION_VALUE0_0 {
-                                byteArray16: &byte_array as *const _ as *mut _,
+                        });
+                        println!("✓ 远程IPv4地址条件已添加: {}", ipv4);
+                    },
+                    IpAddr::V6(ipv6) => {
+                        let ip_bytes = ipv6.octets();
+                        let byte_array = FWP_BYTE_ARRAY16 {
+                            byteArray16: ip_bytes,
+                        };
+                        
+                        conditions.push(FWPM_FILTER_CONDITION0 {
+                            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                            matchType: FWP_MATCH_EQUAL,
+                            conditionValue: FWP_CONDITION_VALUE0 {
+                                r#type: FWP_BYTE_ARRAY16_TYPE,
+                                Anonymous: FWP_CONDITION_VALUE0_0 {
+                                    byteArray16: &byte_array as *const _ as *mut _,
+                                },
                             },
-                        },
-                    });
-                    remote_ip_data = Some(byte_array);
-                    println!("✓ 远程IPv6地址条件已添加: {}", ipv6);
+                        });
+                        println!("✓ 远程IPv6地址条件已添加: {}", ipv6);
+                    }
                 }
-            }
-        }
-        
-        // 添加远程IP网段条件
-        let mut remote_network_data = None; // 变量前加下划线表示未使用
-        if let Some(remote_network) = &rule.remote_ip_network {
-            match remote_network.ip {
-                IpAddr::V4(network_ip) => {
-                    let network_bytes = network_ip.octets();
-                    let mask = !((1u32 << (32 - remote_network.prefix_len)) - 1);
-                    let network_addr = u32::from_be_bytes(network_bytes) & mask;
-                    
-                    let range = FWP_RANGE0 {
-                        valueLow: FWP_VALUE0 {
-                            r#type: FWP_UINT32,
-                            Anonymous: FWP_VALUE0_0 {
-                                uint32: network_addr,
+            } else if let Ok(network) = IpNetwork::from_cidr(remote) {
+                match network.ip {
+                    IpAddr::V4(network_ip) => {
+                        let network_bytes = network_ip.octets();
+                        // 使用安全的掩码计算方式
+                        let mask = if network.prefix_len == 0 {
+                            0u32 // 对于 0.0.0.0/0，掩码为全0
+                        } else if network.prefix_len == 32 {
+                            u32::MAX // 对于单个IP地址，掩码为全1
+                        } else {
+                            !((1u32 << (32 - network.prefix_len)) - 1)
+                        };
+                        let network_addr = u32::from_be_bytes(network_bytes) & mask;
+                        
+                        let range = FWP_RANGE0 {
+                            valueLow: FWP_VALUE0 {
+                                r#type: FWP_UINT32,
+                                Anonymous: FWP_VALUE0_0 {
+                                    uint32: network_addr,
+                                },
                             },
-                        },
-                        valueHigh: FWP_VALUE0 {
-                            r#type: FWP_UINT32,
-                            Anonymous: FWP_VALUE0_0 {
-                                uint32: network_addr | !mask,
+                            valueHigh: FWP_VALUE0 {
+                                r#type: FWP_UINT32,
+                                Anonymous: FWP_VALUE0_0 {
+                                    uint32: network_addr | !mask,
+                                },
                             },
-                        },
-                    };
-                    
-                    conditions.push(FWPM_FILTER_CONDITION0 {
-                        fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
-                        matchType: FWP_MATCH_RANGE,
-                        conditionValue: FWP_CONDITION_VALUE0 {
-                            r#type: FWP_RANGE_TYPE,
-                            Anonymous: FWP_CONDITION_VALUE0_0 {
-                                rangeValue: &range as *const _ as *mut _,
+                        };
+                        
+                        conditions.push(FWPM_FILTER_CONDITION0 {
+                            fieldKey: FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                            matchType: FWP_MATCH_RANGE,
+                            conditionValue: FWP_CONDITION_VALUE0 {
+                                r#type: FWP_RANGE_TYPE,
+                                Anonymous: FWP_CONDITION_VALUE0_0 {
+                                    rangeValue: &range as *const _ as *mut _,
+                                },
                             },
-                        },
-                    });
-                    remote_network_data = Some(range);
-                    println!("✓ 远程IPv4网段条件已添加: {}/{}", network_ip, remote_network.prefix_len);
-                },
-                IpAddr::V6(_) => {
-                    println!("⚠️ IPv6网段过滤暂不支持，将跳过此条件");
+                        });
+                        println!("✓ 远程IPv4网段条件已添加: {}/{}", network_ip, network.prefix_len);
+                    },
+                    IpAddr::V6(_) => {
+                        println!("⚠️ IPv6网段过滤暂不支持，将跳过此条件");
+                    }
                 }
             }
         }
@@ -660,7 +722,7 @@ impl WfpController {
             effectiveWeight: FWP_VALUE0 {
                 r#type: FWP_UINT64,
                 Anonymous: FWP_VALUE0_0 {
-                    uint64: unsafe { &raw mut EFFECTIVE_WEIGHT_VALUE as *mut u64 },
+                    uint64: &raw mut EFFECTIVE_WEIGHT_VALUE as *mut u64,
                 },
             },
         };
@@ -740,7 +802,7 @@ impl WfpController {
                 // 设置权重
                 r#type: FWP_UINT64,
                 Anonymous: FWP_VALUE0_0 {
-                    uint64: unsafe { &raw mut WEIGHT_VALUE as *mut u64 },
+                    uint64: &raw mut WEIGHT_VALUE as *mut u64,
                 },
             },
             numFilterConditions: num_conditions, // 条件数量
