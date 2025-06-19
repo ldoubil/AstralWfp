@@ -18,8 +18,7 @@ impl IpNetwork {
     pub fn new(ip: IpAddr, prefix_len: u8) -> Self {
         Self { ip, prefix_len }
     }
-    
-    pub fn from_cidr(cidr: &str) -> std::result::Result<Self, String> {
+      pub fn from_cidr(cidr: &str) -> std::result::Result<Self, String> {
         let parts: Vec<&str> = cidr.split('/').collect();
         if parts.len() != 2 {
             return Err("Invalid CIDR format".to_string());
@@ -38,7 +37,26 @@ impl IpNetwork {
             return Err(format!("Prefix length {} exceeds maximum {}", prefix_len, max_prefix));
         }
         
-        Ok(Self::new(ip, prefix_len))
+        // 将IP地址转换为正确的网络地址
+        let network_ip = match ip {
+            IpAddr::V4(ipv4) => {
+                let ip_bytes = ipv4.octets();
+                let ip_u32 = u32::from_be_bytes(ip_bytes);
+                let mask = if prefix_len == 0 {
+                    0u32
+                } else if prefix_len == 32 {
+                    u32::MAX
+                } else {
+                    !((1u32 << (32 - prefix_len)) - 1)
+                };
+                let network_u32 = ip_u32 & mask;
+                let network_bytes = network_u32.to_be_bytes();
+                IpAddr::V4(std::net::Ipv4Addr::from(network_bytes))
+            },
+            IpAddr::V6(_) => ip, // IPv6 处理复杂，暂时保持原样
+        };
+        
+        Ok(Self::new(network_ip, prefix_len))
     }
     
     pub fn contains(&self, ip: &IpAddr) -> bool {
@@ -191,19 +209,43 @@ impl FilterRule {
             },
             IpAddr::V6(_) => true  // IPv6 地址验证逻辑
         }
-    }
-
-    pub fn validate(&self) -> std::result::Result<(), String> {
+    }    pub fn validate(&self) -> std::result::Result<(), String> {
         // 验证远程 IP
         if let Some(remote) = &self.remote {
+            // 尝试解析为单个IP地址
             if let Ok(ip) = remote.parse::<IpAddr>() {
                 if !self.validate_ip(&ip) {
                     return Err(format!("无效的远程 IP 地址: {}", remote));
                 }
-            } else {
+            } 
+            // 尝试解析为CIDR网段
+            else if let Ok(_network) = IpNetwork::from_cidr(remote) {
+                // CIDR格式有效，通过验证
+            } 
+            // 都不是，报错
+            else {
                 return Err(format!("无法解析的 IP 地址格式: {}", remote));
             }
         }
+        
+        // 验证本地 IP（如果存在）
+        if let Some(local) = &self.local {
+            // 尝试解析为单个IP地址
+            if let Ok(ip) = local.parse::<IpAddr>() {
+                if !self.validate_ip(&ip) {
+                    return Err(format!("无效的本地 IP 地址: {}", local));
+                }
+            } 
+            // 尝试解析为CIDR网段
+            else if let Ok(_network) = IpNetwork::from_cidr(local) {
+                // CIDR格式有效，通过验证
+            } 
+            // 都不是，报错
+            else {
+                return Err(format!("无法解析的本地 IP 地址格式: {}", local));
+            }
+        }
+        
         Ok(())
     }
 }
@@ -219,7 +261,7 @@ pub fn to_wide_string(s: &str) -> Vec<u16> {
 // WFP控制器结构体
 pub struct WfpController {
     engine_handle: HANDLE,
-    filter_ids: Vec<u64>,
+    pub filter_ids: Vec<u64>,
 }
 
 impl WfpController {
@@ -288,12 +330,17 @@ impl WfpController {
                 
                 // 根据方向和IP版本确定需要的层
                 let layers = self.get_layers_for_rule(rule);
-                
-                for layer in layers {
-                    if let Ok(filter_id) = self.add_advanced_network_filter(rule, layer) {
-                        self.filter_ids.push(filter_id);
-                        added_count += 1;
-                        println!("✓ {}过滤器添加成功 (ID: {}) - 层: {:?}", rule.name, filter_id, layer);
+                  for layer in layers {
+                    println!("🧪 尝试在层 {} 上添加过滤器...", self.get_layer_name(&layer));
+                    match self.add_advanced_network_filter(rule, layer) {
+                        Ok(filter_id) => {
+                            self.filter_ids.push(filter_id);
+                            added_count += 1;
+                            println!("✅ 过滤器在层 {} 上添加成功 (ID: {})", self.get_layer_name(&layer), filter_id);
+                        },
+                        Err(e) => {
+                            println!("❌ 过滤器在层 {} 上添加失败: {:?}", self.get_layer_name(&layer), e);
+                        }
                     }
                 }
             }
@@ -309,62 +356,93 @@ impl WfpController {
                 Err(Error::from_win32())
             }
         }
-    }
-
-    // 根据规则获取对应的WFP层
-    fn get_layers_for_rule(&self, rule: &FilterRule) -> Vec<GUID> {
+    }    // 根据规则获取对应的WFP层 - 测试所有可能的层组合
+    pub fn get_layers_for_rule(&self, rule: &FilterRule) -> Vec<GUID> {
         let mut layers = Vec::new();
         
-        // 根据IP地址类型和方向确定层
+        // 根据IP地址类型确定IPv4还是IPv6
         let is_ipv6 = rule.local.as_ref().map_or(false, |ip| ip.contains(":")) || 
                      rule.remote.as_ref().map_or(false, |ip| ip.contains(":"));
         
-        match rule.direction {
-            Direction::Outbound => {
-                if is_ipv6 {
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
-                } else {
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
+        println!("🔍 规则分析: {} - 方向: {:?}, IPv6: {}", rule.name, rule.direction, is_ipv6);
+        println!("   APP路径: {:?}", rule.app_path.is_some());
+        if let Some(remote) = &rule.remote {
+            println!("   远程IP: {}", remote);
+        }
+          // 如果有APP_ID + 远程IP的组合，使用测试验证过的层
+        if rule.app_path.is_some() && rule.remote.is_some() {
+            println!("🎯 检测到APP_ID + 远程IP组合，使用测试验证的层...");
+            
+            if !is_ipv6 {
+                // 根据测试结果，只使用成功的IPv4层
+                match rule.direction {
+                    Direction::Outbound => {
+                        // 出站连接使用CONNECT层（测试成功）
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
+                        layers.push(FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4); // 额外保护
+                    },
+                    Direction::Inbound => {
+                        // 入站连接使用RECV_ACCEPT层（测试成功）
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
+                        layers.push(FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4); // 额外保护
+                    },
+                    Direction::Both => {
+                        // 双向连接使用两个主要层（都测试成功）
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
+                        layers.push(FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4); // 额外保护
+                        // 可选：如果需要连接重定向功能
+                        // layers.push(FWPM_LAYER_ALE_CONNECT_REDIRECT_V4);
+                    }
                 }
-            },
-            Direction::Inbound => {
-                if is_ipv6 {
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
-                } else {
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
-                }
-            },
-            Direction::Both => {
-                if is_ipv6 {
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
-                } else {
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
+            } else {
+                // IPv6层（基于IPv4测试结果推断）
+                match rule.direction {
+                    Direction::Outbound => {
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
+                        layers.push(FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6);
+                    },
+                    Direction::Inbound => {
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
+                        layers.push(FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6);
+                    },
+                    Direction::Both => {
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
+                        layers.push(FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6);
+                    }
                 }
             }
-        }
-        
-        // 如果没有指定IP类型，同时添加IPv4和IPv6层
-        if layers.is_empty() {
+        } else {
+            // 没有APP_ID + 远程IP组合的情况，使用标准层
             match rule.direction {
                 Direction::Outbound => {
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
+                    if is_ipv6 {
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
+                    } else {
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
+                    }
                 },
                 Direction::Inbound => {
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
+                    if is_ipv6 {
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
+                    } else {
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
+                    }
                 },
                 Direction::Both => {
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
-                    layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
-                    layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
+                    if is_ipv6 {
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V6);
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
+                    } else {
+                        layers.push(FWPM_LAYER_ALE_AUTH_CONNECT_V4);
+                        layers.push(FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4);
+                    }
                 }
             }
         }
         
+        println!("   将测试 {} 个层", layers.len());
         layers
     }
 
@@ -394,10 +472,8 @@ impl WfpController {
             println!("✓ WFP引擎已关闭");
             Ok(())
         }
-    }
-
-    // 添加高级网络过滤器的内部方法
-    unsafe fn add_advanced_network_filter(
+    }    // 添加高级网络过滤器的内部方法
+    pub unsafe fn add_advanced_network_filter(
         &self,
         rule: &FilterRule,
         layer_key: GUID,
@@ -408,34 +484,59 @@ impl WfpController {
         let filter_desc = to_wide_string(&format!("控制 {} 的网络流量", rule.name));
 
         // 创建过滤条件向量
-        let mut conditions = Vec::new();
-        
-        // 添加应用程序路径条件
+        let mut conditions = Vec::new();        // 添加应用程序路径条件
         let mut _app_id_data = None;
-        if let Some(app_path) = &rule.app_path {
-            let appid_utf16: Vec<u16> = app_path
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            
-            let app_id = FWP_BYTE_BLOB {
-                size: (appid_utf16.len() * 2) as u32,
-                data: appid_utf16.as_ptr() as *mut u8,
+        let mut should_add_app_id = false;        if let Some(app_path) = &rule.app_path {
+            // 基于测试结果，只在成功验证的层上添加APP_ID条件
+            should_add_app_id = match layer_key {
+                // 测试成功的层：支持APP_ID + 远程IP组合
+                FWPM_LAYER_ALE_AUTH_CONNECT_V4 |
+                FWPM_LAYER_ALE_AUTH_CONNECT_V6 |
+                FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4 |
+                FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6 |
+                FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4 |
+                FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6 |
+                FWPM_LAYER_ALE_CONNECT_REDIRECT_V4 |
+                FWPM_LAYER_ALE_CONNECT_REDIRECT_V6 => true,
+                
+                // 测试失败的层：不支持APP_ID + 远程IP组合（但单独APP_ID可能可以）
+                FWPM_LAYER_ALE_AUTH_LISTEN_V4 |
+                FWPM_LAYER_ALE_AUTH_LISTEN_V6 => {
+                    // 只有在没有远程IP条件时才添加APP_ID
+                    rule.remote.is_none()
+                },
+                
+                // 其他层默认不添加APP_ID
+                _ => false,
             };
             
-            conditions.push(FWPM_FILTER_CONDITION0 {
-                fieldKey: FWPM_CONDITION_ALE_APP_ID,
-                matchType: FWP_MATCH_EQUAL,
-                conditionValue: FWP_CONDITION_VALUE0 {
-                    r#type: FWP_BYTE_BLOB_TYPE,
-                    Anonymous: FWP_CONDITION_VALUE0_0 {
-                        byteBlob: &app_id as *const _ as *mut _,
+            if should_add_app_id {
+                let appid_utf16: Vec<u16> = app_path
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                
+                let app_id = FWP_BYTE_BLOB {
+                    size: (appid_utf16.len() * 2) as u32,
+                    data: appid_utf16.as_ptr() as *mut u8,
+                };
+                
+                conditions.push(FWPM_FILTER_CONDITION0 {
+                    fieldKey: FWPM_CONDITION_ALE_APP_ID,
+                    matchType: FWP_MATCH_EQUAL,
+                    conditionValue: FWP_CONDITION_VALUE0 {
+                        r#type: FWP_BYTE_BLOB_TYPE,
+                        Anonymous: FWP_CONDITION_VALUE0_0 {
+                            byteBlob: &app_id as *const _ as *mut _,
+                        },
                     },
-                },
-            });
-            
-            _app_id_data = Some((appid_utf16, app_id));
-            println!("✓ APP_ID条件已添加到过滤器: {}", app_path);
+                });
+                
+                _app_id_data = Some((appid_utf16, app_id));
+                println!("✓ APP_ID条件已添加到过滤器: {}", app_path);
+            } else {
+                println!("⚠️ 跳过APP_ID条件（入站连接在此层不适用）");
+            }
         }
         
         // 添加本地IP/网段条件
@@ -662,14 +763,20 @@ impl WfpController {
             });
             println!("✓ 协议条件已添加: {:?}", protocol);
         }
-        
-        // 获取条件数量
+          // 获取条件数量
         let num_conditions = conditions.len() as u32;
         
         // 确定过滤器动作
         let action_type = match rule.action {
             FilterAction::Allow => FWP_ACTION_PERMIT,
             FilterAction::Block => FWP_ACTION_BLOCK,
+        };
+
+        // 根据是否有远程IP条件调整权重
+        let filter_weight = if rule.remote.is_some() {
+            unsafe { WEIGHT_VALUE += 10; WEIGHT_VALUE } // 远程IP过滤器权重更高
+        } else {
+            unsafe { WEIGHT_VALUE += 1; WEIGHT_VALUE }
         };
 
         // 创建过滤器结构
@@ -686,11 +793,10 @@ impl WfpController {
                 data: ptr::null_mut(),
             },
             layerKey: layer_key,
-            subLayerKey: FWPM_SUBLAYER_UNIVERSAL,
-            weight: FWP_VALUE0 {
+            subLayerKey: FWPM_SUBLAYER_UNIVERSAL,            weight: FWP_VALUE0 {
                 r#type: FWP_UINT64,
                 Anonymous: FWP_VALUE0_0 {
-                    uint64: &raw mut WEIGHT_VALUE as *mut u64, // 移除不必要的 unsafe 块
+                    uint64: &filter_weight as *const u64 as *mut u64,
                 },
             },
             numFilterConditions: num_conditions,
@@ -721,13 +827,27 @@ impl WfpController {
         // 用于存储新添加的过滤器ID
         let mut filter_id = 0u64;
         // 添加过滤器到WFP引擎
-        let add_result = unsafe { FwpmFilterAdd0(self.engine_handle, &filter, None, Some(&mut filter_id)) };
-
-        // 检查添加结果
+        let add_result = unsafe { FwpmFilterAdd0(self.engine_handle, &filter, None, Some(&mut filter_id)) };        // 检查添加结果
         if WIN32_ERROR(add_result) == ERROR_SUCCESS {
             Ok(filter_id)
-        } else {
-            println!("❌ 添加过滤器 '{}' 失败: {}", rule.name, add_result);
+        } else {            let error_msg = match WIN32_ERROR(add_result) {
+                ERROR_ACCESS_DENIED => "访问被拒绝 - 需要管理员权限",
+                ERROR_INVALID_PARAMETER => "无效参数 - 检查过滤条件组合",
+                ERROR_NOT_SUPPORTED => "不支持的操作 - 检查WFP层和条件兼容性",
+                ERROR_ALREADY_EXISTS => "过滤器已存在",
+                ERROR_NOT_FOUND => "找不到指定的层或条件",
+                _ if add_result == 2150760450 => "FWP_E_INVALID_CONDITION - 条件组合无效，某些层不支持特定条件组合",
+                _ => "未知错误",
+            };
+            println!("❌ 添加过滤器 '{}' 失败: {} (错误代码: {})", rule.name, error_msg, add_result);
+            println!("   层: {:?}", layer_key);
+            println!("   条件数量: {}", num_conditions);
+            if rule.app_path.is_some() {
+                println!("   包含APP_ID条件: {}", should_add_app_id);
+            }
+            if rule.remote.is_some() {
+                println!("   包含远程IP条件: true");
+            }
             Err(Error::from_win32())
         }
     }
@@ -812,14 +932,13 @@ impl WfpController {
             Anonymous: FWPM_FILTER0_0 {
                 // 原始上下文
                 rawContext: 0,
-            },
-            reserved: ptr::null_mut(), // 保留字段
+            },            reserved: ptr::null_mut(), // 保留字段
             filterId: 0,               // 过滤器ID初始化为0
             effectiveWeight: FWP_VALUE0 {
                 // 有效权重
                 r#type: FWP_UINT64,
                 Anonymous: FWP_VALUE0_0 {
-                    uint64: unsafe { &raw mut EFFECTIVE_WEIGHT_VALUE as *mut u64 },
+                    uint64: &raw mut EFFECTIVE_WEIGHT_VALUE as *mut u64,
                 },
             },
         };
@@ -835,6 +954,31 @@ impl WfpController {
         } else {
             println!("❌ 添加过滤器 '{}' 失败: {}", name, add_result);
             Err(Error::from_win32()) // 失败返回错误
+        }
+    }    // 获取层的名称用于调试
+    pub fn get_layer_name(&self, layer_key: &GUID) -> &'static str {
+        match *layer_key {
+            FWPM_LAYER_ALE_AUTH_CONNECT_V4 => "ALE_AUTH_CONNECT_V4",
+            FWPM_LAYER_ALE_AUTH_CONNECT_V6 => "ALE_AUTH_CONNECT_V6",
+            FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4 => "ALE_AUTH_RECV_ACCEPT_V4",
+            FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6 => "ALE_AUTH_RECV_ACCEPT_V6",
+            FWPM_LAYER_ALE_AUTH_LISTEN_V4 => "ALE_AUTH_LISTEN_V4",
+            FWPM_LAYER_ALE_AUTH_LISTEN_V6 => "ALE_AUTH_LISTEN_V6",
+            FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4 => "ALE_RESOURCE_ASSIGNMENT_V4",
+            FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6 => "ALE_RESOURCE_ASSIGNMENT_V6",
+            FWPM_LAYER_ALE_RESOURCE_RELEASE_V4 => "ALE_RESOURCE_RELEASE_V4",
+            FWPM_LAYER_ALE_RESOURCE_RELEASE_V6 => "ALE_RESOURCE_RELEASE_V6",
+            FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4 => "ALE_ENDPOINT_CLOSURE_V4",
+            FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6 => "ALE_ENDPOINT_CLOSURE_V6",
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V4 => "ALE_CONNECT_REDIRECT_V4",
+            FWPM_LAYER_ALE_CONNECT_REDIRECT_V6 => "ALE_CONNECT_REDIRECT_V6",
+            FWPM_LAYER_ALE_BIND_REDIRECT_V4 => "ALE_BIND_REDIRECT_V4",
+            FWPM_LAYER_ALE_BIND_REDIRECT_V6 => "ALE_BIND_REDIRECT_V6",
+            FWPM_LAYER_OUTBOUND_TRANSPORT_V4 => "OUTBOUND_TRANSPORT_V4",
+            FWPM_LAYER_OUTBOUND_TRANSPORT_V6 => "OUTBOUND_TRANSPORT_V6",
+            FWPM_LAYER_INBOUND_TRANSPORT_V4 => "INBOUND_TRANSPORT_V4",
+            FWPM_LAYER_INBOUND_TRANSPORT_V6 => "INBOUND_TRANSPORT_V6",
+            _ => "UNKNOWN_LAYER",
         }
     }
 }
