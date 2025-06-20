@@ -26,11 +26,11 @@ async fn test_app_id_remote_ip_filter() -> windows::core::Result<()> {
     println!("🎯 目标应用程序: {:?}", nt_path);
     println!("🔧 基于测试结果添加APP_ID + 远程IP过滤规则...");
     
-    let rules = vec![        // 测试1: 阻止Edge访问特定IP (双向阻止)
+    let rules: Vec<FilterRule> = vec![        // 测试1: 阻止Edge访问特定IP (双向阻止)
         FilterRule::new("阻止Edge访问124.71.134.95")
             .app_path(nt_path)
             .remote_ip("124.71.134.95")
-            .direction(Direction::Outbound)  // 改回 Outbound 或使用 Both
+            .direction(Direction::Both)  // 改回 Outbound 或使用 Both
             .action(FilterAction::Block),
 
     ];
