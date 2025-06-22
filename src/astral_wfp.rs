@@ -118,7 +118,7 @@ pub struct FilterRule {
     pub action: FilterAction,                // 过滤动作（允许/阻止）
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -126,13 +126,13 @@ pub enum Protocol {
 }
 
 // 流量方向枚举
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Direction {
     Inbound,     // 入站流量
     Outbound,    // 出站流量
     Both,        // 双向流量
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FilterAction {
     Allow,
     Block,
@@ -209,7 +209,9 @@ impl FilterRule {
             },
             IpAddr::V6(_) => true  // IPv6 地址验证逻辑
         }
-    }    pub fn validate(&self) -> std::result::Result<(), String> {
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
         // 验证远程 IP
         if let Some(remote) = &self.remote {
             // 尝试解析为单个IP地址
@@ -317,8 +319,9 @@ impl WfpController {
 
 
     // 添加高级过滤器（支持复杂规则）
-    pub fn add_advanced_filters(&mut self, rules: &[FilterRule]) -> Result<()> {
+    pub fn add_advanced_filters(&mut self, rules: &[FilterRule]) -> Result<Vec<u64>> {
         unsafe {
+            let mut added_ids = Vec::new();
             let mut added_count = 0;
             
             for rule in rules {
@@ -330,11 +333,12 @@ impl WfpController {
                 
                 // 根据方向和IP版本确定需要的层
                 let layers = self.get_layers_for_rule(rule);
-                  for layer in layers {
+                for layer in layers {
                     println!("🧪 尝试在层 {} 上添加过滤器...", self.get_layer_name(&layer));
                     match self.add_advanced_network_filter(rule, layer) {
                         Ok(filter_id) => {
                             self.filter_ids.push(filter_id);
+                            added_ids.push(filter_id);
                             added_count += 1;
                             println!("✅ 过滤器在层 {} 上添加成功 (ID: {})", self.get_layer_name(&layer), filter_id);
                         },
@@ -350,13 +354,15 @@ impl WfpController {
                     "\n🔍 网络流量控制已启动，共添加了 {} 个过滤器",
                     added_count
                 );
-                Ok(())
+                Ok(added_ids)
             } else {
                 println!("❌ 没有成功添加任何过滤器");
                 Err(Error::from_win32())
             }
         }
-    }    // 根据规则获取对应的WFP层 - 测试所有可能的层组合
+    }
+
+    // 根据规则获取对应的WFP层 - 测试所有可能的层组合
     pub fn get_layers_for_rule(&self, rule: &FilterRule) -> Vec<GUID> {
         let mut layers = Vec::new();
         
@@ -472,7 +478,9 @@ impl WfpController {
             println!("✓ WFP引擎已关闭");
             Ok(())
         }
-    }    // 添加高级网络过滤器的内部方法
+    }
+
+    // 添加高级网络过滤器的内部方法
     pub unsafe fn add_advanced_network_filter(
         &self,
         rule: &FilterRule,
@@ -827,10 +835,13 @@ impl WfpController {
         // 用于存储新添加的过滤器ID
         let mut filter_id = 0u64;
         // 添加过滤器到WFP引擎
-        let add_result = unsafe { FwpmFilterAdd0(self.engine_handle, &filter, None, Some(&mut filter_id)) };        // 检查添加结果
+        let add_result = unsafe { FwpmFilterAdd0(self.engine_handle, &filter, None, Some(&mut filter_id)) };
+
+        // 检查添加结果
         if WIN32_ERROR(add_result) == ERROR_SUCCESS {
             Ok(filter_id)
-        } else {            let error_msg = match WIN32_ERROR(add_result) {
+        } else {
+            let error_msg = match WIN32_ERROR(add_result) {
                 ERROR_ACCESS_DENIED => "访问被拒绝 - 需要管理员权限",
                 ERROR_INVALID_PARAMETER => "无效参数 - 检查过滤条件组合",
                 ERROR_NOT_SUPPORTED => "不支持的操作 - 检查WFP层和条件兼容性",
@@ -852,110 +863,7 @@ impl WfpController {
         }
     }
 
-    // 添加网络过滤器的内部方法（保持向后兼容）
-    unsafe fn add_network_filter(
-        &self,
-        name: &str,
-        layer_key: GUID,
-        appid: Option<&[u16]>,
-    ) -> Result<u64> {
-        // 将过滤器名称转换为宽字符串
-        let filter_name = to_wide_string(name);
-        // 生成过滤器描述并转换为宽字符串
-        let filter_desc = to_wide_string(&format!("控制 {} 的网络流量", name));
-
-        // 创建过滤条件向量
-        let mut conditions = Vec::new();
-        // 如果提供了应用程序路径，添加应用程序ID条件
-
-        if let Some(appid_utf16) = appid {
-            let app_id = FWP_BYTE_BLOB {
-                size: (appid_utf16.len() * 2) as u32,
-                data: appid_utf16.as_ptr() as *mut u8,
-            };
-
-            // 添加应用程序ID匹配条件
-            conditions.push(FWPM_FILTER_CONDITION0 {
-                fieldKey: FWPM_CONDITION_ALE_APP_ID, // 使用应用程序ID字段
-                matchType: FWP_MATCH_EQUAL,          // 使用相等匹配
-                conditionValue: FWP_CONDITION_VALUE0 {
-                    r#type: FWP_BYTE_BLOB_TYPE, // 值类型为字节blob
-                    Anonymous: FWP_CONDITION_VALUE0_0 {
-                        byteBlob: &app_id as *const _ as *mut _,
-                    },
-                },
-            });
-
-            println!("✓ APP_ID条件已添加到过滤器");
-            println!("========================\n");
-        }
-        // 获取条件数量
-        let num_conditions = conditions.len() as u32;
-
-        // 创建过滤器结构
-        let filter = FWPM_FILTER0 {
-            filterKey: GUID::zeroed(), // 使用空GUID
-            displayData: FWPM_DISPLAY_DATA0 {
-                // 显示信息
-                name: PWSTR(filter_name.as_ptr() as *mut u16),
-                description: PWSTR(filter_desc.as_ptr() as *mut u16),
-            },
-            flags: FWPM_FILTER_FLAGS(0),  // 无特殊标志
-            providerKey: ptr::null_mut(), // 无提供者
-            providerData: FWP_BYTE_BLOB {
-                // 空提供者数据
-                size: 0,
-                data: ptr::null_mut(),
-            },
-            layerKey: layer_key,                  // 设置过滤层
-            subLayerKey: FWPM_SUBLAYER_UNIVERSAL, // 使用通用子层
-            weight: FWP_VALUE0 {
-                // 设置权重
-                r#type: FWP_UINT64,
-                Anonymous: FWP_VALUE0_0 {
-                    uint64: &raw mut WEIGHT_VALUE as *mut u64,
-                },
-            },
-            numFilterConditions: num_conditions, // 条件数量
-            filterCondition: if num_conditions > 0 {
-                conditions.as_ptr() as *mut _
-            } else {
-                ptr::null_mut()
-            }, // 条件数组
-            action: FWPM_ACTION0 {
-                // 设置动作为阻止
-                r#type: FWP_ACTION_BLOCK,
-                Anonymous: FWPM_ACTION0_0 {
-                    calloutKey: GUID::zeroed(),
-                },
-            },
-            Anonymous: FWPM_FILTER0_0 {
-                // 原始上下文
-                rawContext: 0,
-            },            reserved: ptr::null_mut(), // 保留字段
-            filterId: 0,               // 过滤器ID初始化为0
-            effectiveWeight: FWP_VALUE0 {
-                // 有效权重
-                r#type: FWP_UINT64,
-                Anonymous: FWP_VALUE0_0 {
-                    uint64: &raw mut EFFECTIVE_WEIGHT_VALUE as *mut u64,
-                },
-            },
-        };
-
-        // 用于存储新添加的过滤器ID
-        let mut filter_id = 0u64;
-        // 添加过滤器到WFP引擎
-        let add_result = unsafe { FwpmFilterAdd0(self.engine_handle, &filter, None, Some(&mut filter_id)) };
-
-        // 检查添加结果
-        if WIN32_ERROR(add_result) == ERROR_SUCCESS {
-            Ok(filter_id) // 成功返回过滤器ID
-        } else {
-            println!("❌ 添加过滤器 '{}' 失败: {}", name, add_result);
-            Err(Error::from_win32()) // 失败返回错误
-        }
-    }    // 获取层的名称用于调试
+    // 获取层的名称用于调试
     pub fn get_layer_name(&self, layer_key: &GUID) -> &'static str {
         match *layer_key {
             FWPM_LAYER_ALE_AUTH_CONNECT_V4 => "ALE_AUTH_CONNECT_V4",
@@ -980,5 +888,64 @@ impl WfpController {
             FWPM_LAYER_INBOUND_TRANSPORT_V6 => "INBOUND_TRANSPORT_V6",
             _ => "UNKNOWN_LAYER",
         }
+    }
+
+    // 删除指定的过滤器
+    pub fn delete_filters(&mut self, filter_ids: &[u64]) -> Result<u32> {
+        unsafe {
+            let mut deleted_count = 0;
+            
+            for &filter_id in filter_ids {
+                let delete_result = FwpmFilterDeleteById0(self.engine_handle, filter_id);
+                if WIN32_ERROR(delete_result) == ERROR_SUCCESS {
+                    // 从内部列表中移除
+                    if let Some(pos) = self.filter_ids.iter().position(|&id| id == filter_id) {
+                        self.filter_ids.remove(pos);
+                    }
+                    deleted_count += 1;
+                    println!("✓ 过滤器 {} 已删除", filter_id);
+                } else {
+                    println!("⚠️ 删除过滤器 {} 失败: {}", filter_id, delete_result);
+                }
+            }
+            
+            if deleted_count > 0 {
+                Ok(deleted_count)
+            } else {
+                Err(Error::from_win32())
+            }
+        }
+    }
+
+    // 删除单个过滤器
+    pub fn remove_filter(&mut self, filter_id: u64) -> Result<()> {
+        unsafe {
+            let delete_result = FwpmFilterDeleteById0(self.engine_handle, filter_id);
+            if WIN32_ERROR(delete_result) == ERROR_SUCCESS {
+                // 从内部列表中移除
+                if let Some(pos) = self.filter_ids.iter().position(|&id| id == filter_id) {
+                    self.filter_ids.remove(pos);
+                }
+                println!("✓ 过滤器 {} 已删除", filter_id);
+                Ok(())
+            } else {
+                println!("⚠️ 删除过滤器 {} 失败: {}", filter_id, delete_result);
+                Err(Error::from_win32())
+            }
+        }
+    }
+
+    // 获取所有规则（简化版本，返回当前添加的规则）
+    pub fn get_rules(&self) -> Result<Vec<FilterRule>> {
+        // 这是一个简化实现，实际应该从WFP引擎查询
+        // 由于WFP API复杂，这里返回一个空列表
+        // 在实际应用中，需要实现完整的WFP枚举功能
+        Ok(Vec::new())
+    }
+
+    // 获取规则对应的过滤器ID
+    pub fn get_filter_ids(&self, _rule: &FilterRule) -> Result<Vec<u64>> {
+        // 简化实现，返回当前存储的过滤器ID
+        Ok(self.filter_ids.clone())
     }
 }
