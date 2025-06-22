@@ -1,6 +1,7 @@
 use eframe::egui;
 use std::sync::{Arc, Mutex};
-use crate::astral_wfp::{WfpController, FilterRule, Direction, FilterAction};
+use crate::astral_wfp::{WfpController, FilterRule, Direction, FilterAction, Protocol};
+use crate::nt::get_nt_path;
 
 // 规则信息结构体
 #[derive(Debug, Clone)]
@@ -28,6 +29,7 @@ pub struct WfpGui {
     remote_ip: String,
     local_port: String,
     remote_port: String,
+    selected_protocol: Option<Protocol>,
     selected_direction: Direction,
     selected_action: FilterAction,
 }
@@ -46,6 +48,7 @@ impl Default for WfpGui {
             remote_ip: "".to_string(),
             local_port: "".to_string(),
             remote_port: "".to_string(),
+            selected_protocol: None,
             selected_direction: Direction::Both,
             selected_action: FilterAction::Block,
         }
@@ -125,6 +128,36 @@ impl eframe::App for WfpGui {
                     }
                 });
                 ui.horizontal(|ui| {
+                    ui.label("协议:");
+                    egui::ComboBox::from_id_source("protocol")
+                        .selected_text(match self.selected_protocol {
+                            Some(Protocol::Tcp) => "TCP",
+                            Some(Protocol::Udp) => "UDP",
+                            Some(Protocol::Icmp) => "ICMP",
+                            Some(Protocol::IcmpV6) => "ICMPv6",
+                            Some(Protocol::Igmp) => "IGMP",
+                            Some(Protocol::Ah) => "AH",
+                            Some(Protocol::Esp) => "ESP",
+                            Some(Protocol::Gre) => "GRE",
+                            Some(Protocol::Ipsec) => "IPSEC",
+                            Some(Protocol::Any) => "任意协议",
+                            None => "任意协议",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Tcp), "TCP");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Udp), "UDP");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Icmp), "ICMP");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::IcmpV6), "ICMPv6");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Igmp), "IGMP");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Ah), "AH");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Esp), "ESP");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Gre), "GRE");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Ipsec), "IPSEC");
+                            ui.selectable_value(&mut self.selected_protocol, Some(Protocol::Any), "任意协议");
+                            ui.selectable_value(&mut self.selected_protocol, None, "任意协议");
+                        });
+                });
+                ui.horizontal(|ui| {
                     ui.label("方向:");
                     egui::ComboBox::from_id_source("direction")
                         .selected_text(match self.selected_direction {
@@ -183,7 +216,7 @@ impl eframe::App for WfpGui {
                                                 ui.vertical(|ui| {
                                                     egui::Frame::group(ui.style())
                                                         .show(ui, |ui| {
-                                                            ui.set_min_size(egui::vec2(card_width - 10.0, 120.0));
+                                                            ui.set_min_size(egui::vec2(card_width - 10.0, 160.0));
                                                             ui.horizontal(|ui| {
                                                                 ui.label(format!("规则 {}", rule_index + 1));
                                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -195,6 +228,12 @@ impl eframe::App for WfpGui {
                                                             ui.label(format!("名称: {}", rule_info.rule.name));
                                                             ui.label(format!("动作: {:?}", rule_info.rule.action));
                                                             ui.label(format!("方向: {:?}", rule_info.rule.direction));
+                                                            if let Some(app_path) = &rule_info.rule.app_path {
+                                                                ui.label(format!("应用程序: {}", app_path));
+                                                            }
+                                                            if let Some(protocol) = &rule_info.rule.protocol {
+                                                                ui.label(format!("协议: {}", protocol));
+                                                            }
                                                             if let Some(ip) = &rule_info.rule.local {
                                                                 ui.label(format!("本地IP: {}", ip));
                                                             }
@@ -272,7 +311,16 @@ impl WfpGui {
             .direction(self.selected_direction.clone())
             .action(self.selected_action.clone());
         if !self.app_path.is_empty() {
-            rule = rule.app_path(&self.app_path);
+            // 对应用程序路径进行NT转换
+            let nt_path = match get_nt_path(&self.app_path) {
+                Some(path) => path,
+                None => {
+                    self.status_message = format!("应用程序路径转换失败: {}", self.app_path);
+                    self.status_color = egui::Color32::RED;
+                    return;
+                }
+            };
+            rule = rule.app_path(&nt_path);
         }
         if !self.local_ip.is_empty() {
             rule = rule.local_ip(&self.local_ip);
@@ -285,6 +333,9 @@ impl WfpGui {
         }
         if let Ok(port) = self.remote_port.parse::<u16>() {
             rule = rule.remote_port(port);
+        }
+        if let Some(protocol) = &self.selected_protocol {
+            rule = rule.protocol(protocol.clone());
         }
         if let Some(controller) = &mut *self.wfp_controller.lock().unwrap() {
             match controller.add_advanced_filters(&[rule.clone()]) {

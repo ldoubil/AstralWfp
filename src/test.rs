@@ -8,6 +8,7 @@ use crate::{
     Protocol,
     IpNetwork
 };
+use crate::nt::get_nt_path;
 use std::net::IpAddr;
 use windows::core::Result;
 
@@ -154,6 +155,60 @@ fn test_complex_rule_combination() -> Result<()> {
     ];
     
     controller.add_advanced_filters(&rules)?;
+    controller.cleanup()?;
+    Ok(())
+}
+
+/// 测试NT路径转换功能
+#[test]
+fn test_nt_path_conversion() {
+    // 测试常见的Windows路径转换
+    let test_cases = vec![
+        ("C:\\Windows\\System32\\notepad.exe", true),
+        ("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", true),
+        ("D:\\test\\app.exe", true),
+        ("invalid_path", false),
+    ];
+    
+    for (path, should_succeed) in test_cases {
+        let result = get_nt_path(path);
+        match result {
+            Some(nt_path) => {
+                assert!(should_succeed, "路径 {} 应该转换失败，但得到了: {}", path, nt_path);
+                println!("✓ {} -> {}", path, nt_path);
+                // 验证NT路径格式
+                assert!(nt_path.starts_with("\\device\\") || nt_path.starts_with("\\??\\"));
+            },
+            None => {
+                assert!(!should_succeed, "路径 {} 应该转换成功，但失败了", path);
+                println!("✗ {} -> 转换失败", path);
+            }
+        }
+    }
+}
+
+/// 测试带NT路径转换的过滤规则
+#[test]
+fn test_filter_rule_with_nt_path() -> Result<()> {
+    let mut controller = WfpController::new()?;
+    controller.initialize()?;
+    
+    // 测试应用程序路径转换
+    let app_path = "C:\\Windows\\System32\\notepad.exe";
+    let nt_path = match get_nt_path(app_path) {
+        Some(path) => path,
+        None => {
+            println!("⚠️ 跳过测试：无法转换路径 {}", app_path);
+            return Ok(());
+        }
+    };
+    
+    let rule = FilterRule::new("NT路径测试")
+        .app_path(&nt_path)
+        .remote_ip("8.8.8.8")
+        .action(FilterAction::Block);
+    
+    controller.add_advanced_filters(&[rule])?;
     controller.cleanup()?;
     Ok(())
 }

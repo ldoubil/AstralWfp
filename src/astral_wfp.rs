@@ -2,6 +2,12 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr}; // 移除未使用的导入 Ipv4Addr 和 Ipv6Addr
+use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs;
+use std::path::Path;
+use std::str::FromStr;
+use serde::{Serialize, Deserialize};
 use windows::{
     Win32::Foundation::*, Win32::NetworkManagement::WindowsFilteringPlatform::*,
     Win32::System::Rpc::*, core::*,
@@ -103,6 +109,35 @@ const FWP_ACTION_PERMIT: u32 = 0x00000002 | 0x00001000;
 static mut WEIGHT_VALUE: u64 = 1000;
 static mut EFFECTIVE_WEIGHT_VALUE: u64 = 0;
 
+// 缓存结构体，用于提高性能
+#[derive(Debug, Clone)]
+pub struct FilterCache {
+    pub app_path_cache: std::collections::HashMap<String, String>, // 原始路径 -> NT路径
+    pub layer_cache: std::collections::HashMap<String, Vec<GUID>>, // 规则签名 -> 层列表
+}
+
+impl FilterCache {
+    pub fn new() -> Self {
+        Self {
+            app_path_cache: std::collections::HashMap::new(),
+            layer_cache: std::collections::HashMap::new(),
+        }
+    }
+    
+    pub fn get_nt_path(&mut self, original_path: &str) -> Option<String> {
+        if let Some(cached) = self.app_path_cache.get(original_path) {
+            return Some(cached.clone());
+        }
+        
+        if let Some(nt_path) = crate::nt::get_nt_path(original_path) {
+            self.app_path_cache.insert(original_path.to_string(), nt_path.clone());
+            Some(nt_path)
+        } else {
+            None
+        }
+    }
+}
+
 // 过滤规则结构体
 #[derive(Debug, Clone)]
 // 过滤规则结构体
@@ -113,9 +148,16 @@ pub struct FilterRule {
     pub remote: Option<String>,   // 远程IP地址/网段，格式如: "8.8.8.8" 或 "8.8.0.0/16"（可选）
     pub local_port: Option<u16>,             // 本地端口（可选）
     pub remote_port: Option<u16>,            // 远程端口（可选）
+    pub local_port_range: Option<(u16, u16)>, // 本地端口范围（可选）
+    pub remote_port_range: Option<(u16, u16)>, // 远程端口范围（可选）
     pub protocol: Option<Protocol>,          // 协议类型（可选）
     pub direction: Direction,                // 流量方向
     pub action: FilterAction,                // 过滤动作（允许/阻止）
+    pub priority: u32,                       // 规则优先级（数字越大优先级越高）
+    pub group: Option<String>,               // 规则分组
+    pub enabled: bool,                       // 规则是否启用
+    pub time_control: Option<TimeControl>,   // 时间控制
+    pub description: Option<String>,         // 规则描述
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -123,6 +165,50 @@ pub enum Protocol {
     Tcp,
     Udp,
     Icmp,
+    IcmpV6,
+    Igmp,
+    Ah,      // Authentication Header
+    Esp,     // Encapsulating Security Payload
+    Gre,     // Generic Routing Encapsulation
+    Ipsec,   // IP Security
+    Any,     // 任意协议
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::Tcp => write!(f, "TCP"),
+            Protocol::Udp => write!(f, "UDP"),
+            Protocol::Icmp => write!(f, "ICMP"),
+            Protocol::IcmpV6 => write!(f, "ICMPv6"),
+            Protocol::Igmp => write!(f, "IGMP"),
+            Protocol::Ah => write!(f, "AH"),
+            Protocol::Esp => write!(f, "ESP"),
+            Protocol::Gre => write!(f, "GRE"),
+            Protocol::Ipsec => write!(f, "IPSEC"),
+            Protocol::Any => write!(f, "任意协议"),
+        }
+    }
+}
+
+impl FromStr for Protocol {
+    type Err = String;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "tcp" => Ok(Protocol::Tcp),
+            "udp" => Ok(Protocol::Udp),
+            "icmp" => Ok(Protocol::Icmp),
+            "icmpv6" => Ok(Protocol::IcmpV6),
+            "igmp" => Ok(Protocol::Igmp),
+            "ah" => Ok(Protocol::Ah),
+            "esp" => Ok(Protocol::Esp),
+            "gre" => Ok(Protocol::Gre),
+            "ipsec" => Ok(Protocol::Ipsec),
+            "any" => Ok(Protocol::Any),
+            _ => Err(format!("未知协议: {}", s)),
+        }
+    }
 }
 
 // 流量方向枚举
@@ -147,9 +233,16 @@ impl FilterRule {
             remote: None,
             local_port: None,
             remote_port: None,
+            local_port_range: None,
+            remote_port_range: None,
             protocol: None,
             direction: Direction::Both,
             action: FilterAction::Block,
+            priority: 0,
+            group: None,
+            enabled: true,
+            time_control: None,
+            description: None,
         }
     }
 
@@ -179,6 +272,16 @@ impl FilterRule {
         self
     }
 
+    pub fn local_port_range(mut self, start: u16, end: u16) -> Self {
+        self.local_port_range = Some((start, end));
+        self
+    }
+
+    pub fn remote_port_range(mut self, start: u16, end: u16) -> Self {
+        self.remote_port_range = Some((start, end));
+        self
+    }
+
     pub fn protocol(mut self, protocol: Protocol) -> Self {
         self.protocol = Some(protocol);
         self
@@ -192,6 +295,46 @@ impl FilterRule {
     pub fn action(mut self, action: FilterAction) -> Self {
         self.action = action;
         self
+    }
+
+    pub fn priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
+    
+    pub fn group(mut self, group: &str) -> Self {
+        self.group = Some(group.to_string());
+        self
+    }
+    
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+    
+    pub fn time_control(mut self, time_control: TimeControl) -> Self {
+        self.time_control = Some(time_control);
+        self
+    }
+    
+    pub fn description(mut self, description: &str) -> Self {
+        self.description = Some(description.to_string());
+        self
+    }
+    
+    // 生成规则签名，用于缓存
+    pub fn signature(&self) -> String {
+        format!("{}_{:?}_{:?}_{:?}_{:?}_{:?}_{:?}_{:?}_{:?}",
+            self.name,
+            self.app_path,
+            self.local,
+            self.remote,
+            self.local_port,
+            self.remote_port,
+            self.protocol,
+            self.direction,
+            self.action
+        )
     }
 
     fn validate_ip(&self, ip: &IpAddr) -> bool {
@@ -734,6 +877,33 @@ impl WfpController {
                 },
             });
             println!("✓ 本地端口条件已添加: {}", local_port);
+        } else if let Some((start_port, end_port)) = rule.local_port_range {
+            let range = FWP_RANGE0 {
+                valueLow: FWP_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_VALUE0_0 {
+                        uint16: start_port,
+                    },
+                },
+                valueHigh: FWP_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_VALUE0_0 {
+                        uint16: end_port,
+                    },
+                },
+            };
+            
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_LOCAL_PORT,
+                matchType: FWP_MATCH_RANGE,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_RANGE_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        rangeValue: &range as *const _ as *mut _,
+                    },
+                },
+            });
+            println!("✓ 本地端口范围条件已添加: {}-{}", start_port, end_port);
         }
         
         // 添加远程端口条件
@@ -749,6 +919,33 @@ impl WfpController {
                 },
             });
             println!("✓ 远程端口条件已添加: {}", remote_port);
+        } else if let Some((start_port, end_port)) = rule.remote_port_range {
+            let range = FWP_RANGE0 {
+                valueLow: FWP_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_VALUE0_0 {
+                        uint16: start_port,
+                    },
+                },
+                valueHigh: FWP_VALUE0 {
+                    r#type: FWP_UINT16,
+                    Anonymous: FWP_VALUE0_0 {
+                        uint16: end_port,
+                    },
+                },
+            };
+            
+            conditions.push(FWPM_FILTER_CONDITION0 {
+                fieldKey: FWPM_CONDITION_IP_REMOTE_PORT,
+                matchType: FWP_MATCH_RANGE,
+                conditionValue: FWP_CONDITION_VALUE0 {
+                    r#type: FWP_RANGE_TYPE,
+                    Anonymous: FWP_CONDITION_VALUE0_0 {
+                        rangeValue: &range as *const _ as *mut _,
+                    },
+                },
+            });
+            println!("✓ 远程端口范围条件已添加: {}-{}", start_port, end_port);
         }
         
         // 添加协议条件
@@ -757,6 +954,13 @@ impl WfpController {
                 Protocol::Tcp => 6u8,
                 Protocol::Udp => 17u8,
                 Protocol::Icmp => 1u8,
+                Protocol::IcmpV6 => 58u8,
+                Protocol::Igmp => 2u8,
+                Protocol::Ah => 51u8,
+                Protocol::Esp => 50u8,
+                Protocol::Gre => 47u8,
+                Protocol::Ipsec => 50u8,
+                Protocol::Any => 0u8,
             };
             
             conditions.push(FWPM_FILTER_CONDITION0 {
@@ -948,4 +1152,303 @@ impl WfpController {
         // 简化实现，返回当前存储的过滤器ID
         Ok(self.filter_ids.clone())
     }
+
+    // 导出规则配置
+    pub fn export_rules(&self, file_path: &Path) -> Result<()> {
+        let config = RuleConfig {
+            version: "1.0".to_string(),
+            rules: self.get_rules()?.into_iter().map(|rule| {
+                FilterRuleConfig {
+                    name: rule.name,
+                    app_path: rule.app_path,
+                    local_ip: rule.local,
+                    remote_ip: rule.remote,
+                    local_port: rule.local_port,
+                    remote_port: rule.remote_port,
+                    local_port_range: rule.local_port_range,
+                    remote_port_range: rule.remote_port_range,
+                    protocol: rule.protocol.map(|p| p.to_string()),
+                    direction: format!("{:?}", rule.direction),
+                    action: format!("{:?}", rule.action),
+                    priority: rule.priority,
+                    group: rule.group,
+                    enabled: rule.enabled,
+                    description: rule.description,
+                }
+            }).collect(),
+            groups: vec![], // TODO: 实现分组管理
+            metadata: MetadataConfig {
+                created_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .to_string(),
+                created_by: "AstralWFP".to_string(),
+                description: Some("导出的WFP规则配置".to_string()),
+                tags: vec!["wfp".to_string(), "firewall".to_string()],
+            },
+        };
+        
+        let json = serde_json::to_string_pretty(&config)
+            .map_err(|e| Error::new(windows::core::HRESULT(0x80004005u32 as i32), (&e.to_string()).into()))?;
+        
+        fs::write(file_path, json)
+            .map_err(|e| Error::new(windows::core::HRESULT(0x80004005u32 as i32), (&e.to_string()).into()))?;
+        
+        println!("✅ 规则配置已导出到: {:?}", file_path);
+        Ok(())
+    }
+    
+    // 导入规则配置
+    pub fn import_rules(&mut self, file_path: &Path) -> Result<()> {
+        let content = fs::read_to_string(file_path)
+            .map_err(|e| Error::new(windows::core::HRESULT(0x80004005u32 as i32), (&e.to_string()).into()))?;
+        
+        let config: RuleConfig = serde_json::from_str(&content)
+            .map_err(|e| Error::new(windows::core::HRESULT(0x80004005u32 as i32), (&e.to_string()).into()))?;
+        
+        let rules: Vec<FilterRule> = config.rules.into_iter().map(|rule_config| {
+            let mut rule = FilterRule::new(&rule_config.name)
+                .priority(rule_config.priority)
+                .enabled(rule_config.enabled);
+            
+            if let Some(app_path) = rule_config.app_path {
+                rule = rule.app_path(&app_path);
+            }
+            if let Some(local_ip) = rule_config.local_ip {
+                rule = rule.local_ip(&local_ip);
+            }
+            if let Some(remote_ip) = rule_config.remote_ip {
+                rule = rule.remote_ip(&remote_ip);
+            }
+            if let Some(local_port) = rule_config.local_port {
+                rule = rule.local_port(local_port);
+            }
+            if let Some(remote_port) = rule_config.remote_port {
+                rule = rule.remote_port(remote_port);
+            }
+            if let Some((start, end)) = rule_config.local_port_range {
+                rule = rule.local_port_range(start, end);
+            }
+            if let Some((start, end)) = rule_config.remote_port_range {
+                rule = rule.remote_port_range(start, end);
+            }
+            if let Some(protocol_str) = rule_config.protocol {
+                if let Ok(protocol) = protocol_str.parse::<Protocol>() {
+                    rule = rule.protocol(protocol);
+                }
+            }
+            
+            // 解析方向和动作
+            match rule_config.direction.as_str() {
+                "Inbound" => rule = rule.direction(Direction::Inbound),
+                "Outbound" => rule = rule.direction(Direction::Outbound),
+                "Both" => rule = rule.direction(Direction::Both),
+                _ => rule = rule.direction(Direction::Both),
+            }
+            
+            match rule_config.action.as_str() {
+                "Allow" => rule = rule.action(FilterAction::Allow),
+                "Block" => rule = rule.action(FilterAction::Block),
+                _ => rule = rule.action(FilterAction::Block),
+            }
+            
+            if let Some(group) = rule_config.group {
+                rule = rule.group(&group);
+            }
+            if let Some(description) = rule_config.description {
+                rule = rule.description(&description);
+            }
+            
+            rule
+        }).collect();
+        
+        // 应用导入的规则
+        self.add_advanced_filters(&rules)?;
+        
+        println!("✅ 规则配置已从 {:?} 导入，共导入 {} 条规则", file_path, rules.len());
+        Ok(())
+    }
+}
+
+// 时间控制结构体
+#[derive(Debug, Clone)]
+pub struct TimeControl {
+    pub start_time: Option<u64>,    // 开始时间戳（Unix时间戳）
+    pub end_time: Option<u64>,      // 结束时间戳（Unix时间戳）
+    pub days_of_week: Option<Vec<u8>>, // 星期几（0=周日，1=周一，...）
+    pub hours: Option<(u8, u8)>,    // 小时范围 (start_hour, end_hour)
+}
+
+impl TimeControl {
+    pub fn new() -> Self {
+        Self {
+            start_time: None,
+            end_time: None,
+            days_of_week: None,
+            hours: None,
+        }
+    }
+    
+    pub fn start_time(mut self, timestamp: u64) -> Self {
+        self.start_time = Some(timestamp);
+        self
+    }
+    
+    pub fn end_time(mut self, timestamp: u64) -> Self {
+        self.end_time = Some(timestamp);
+        self
+    }
+    
+    pub fn days_of_week(mut self, days: Vec<u8>) -> Self {
+        self.days_of_week = Some(days);
+        self
+    }
+    
+    pub fn hours(mut self, start: u8, end: u8) -> Self {
+        self.hours = Some((start, end));
+        self
+    }
+    
+    pub fn is_active(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // 检查时间范围
+        if let Some(start) = self.start_time {
+            if now < start {
+                return false;
+            }
+        }
+        
+        if let Some(end) = self.end_time {
+            if now > end {
+                return false;
+            }
+        }
+        
+        // 检查星期几
+        if let Some(days) = &self.days_of_week {
+            let weekday = (now / 86400 + 4) % 7; // 计算星期几（0=周日）
+            if !days.contains(&(weekday as u8)) {
+                return false;
+            }
+        }
+        
+        // 检查小时范围
+        if let Some((start_hour, end_hour)) = self.hours {
+            let hour = (now % 86400) / 3600;
+            if hour < start_hour as u64 || hour > end_hour as u64 {
+                return false;
+            }
+        }
+        
+        true
+    }
+}
+
+// 流量统计结构体
+#[derive(Debug, Clone, Default)]
+pub struct TrafficStats {
+    pub packets_allowed: u64,
+    pub packets_blocked: u64,
+    pub bytes_allowed: u64,
+    pub bytes_blocked: u64,
+    pub connections_allowed: u64,
+    pub connections_blocked: u64,
+    pub last_activity: Option<u64>,
+}
+
+impl TrafficStats {
+    pub fn new() -> Self {
+        Self {
+            packets_allowed: 0,
+            packets_blocked: 0,
+            bytes_allowed: 0,
+            bytes_blocked: 0,
+            connections_allowed: 0,
+            connections_blocked: 0,
+            last_activity: None,
+        }
+    }
+    
+    pub fn increment_allowed(&mut self, packets: u64, bytes: u64) {
+        self.packets_allowed += packets;
+        self.bytes_allowed += bytes;
+        self.connections_allowed += 1;
+        self.last_activity = Some(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs());
+    }
+    
+    pub fn increment_blocked(&mut self, packets: u64, bytes: u64) {
+        self.packets_blocked += packets;
+        self.bytes_blocked += bytes;
+        self.connections_blocked += 1;
+        self.last_activity = Some(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs());
+    }
+    
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+// 规则统计结构体
+#[derive(Debug, Clone)]
+pub struct RuleStats {
+    pub rule_id: String,
+    pub rule_name: String,
+    pub traffic_stats: TrafficStats,
+    pub hit_count: u64,
+    pub miss_count: u64,
+    pub average_response_time: f64,
+}
+
+// 规则配置结构体（用于导入/导出）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleConfig {
+    pub version: String,
+    pub rules: Vec<FilterRuleConfig>,
+    pub groups: Vec<GroupConfig>,
+    pub metadata: MetadataConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterRuleConfig {
+    pub name: String,
+    pub app_path: Option<String>,
+    pub local_ip: Option<String>,
+    pub remote_ip: Option<String>,
+    pub local_port: Option<u16>,
+    pub remote_port: Option<u16>,
+    pub local_port_range: Option<(u16, u16)>,
+    pub remote_port_range: Option<(u16, u16)>,
+    pub protocol: Option<String>,
+    pub direction: String,
+    pub action: String,
+    pub priority: u32,
+    pub group: Option<String>,
+    pub enabled: bool,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupConfig {
+    pub name: String,
+    pub description: Option<String>,
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataConfig {
+    pub created_at: String,
+    pub created_by: String,
+    pub description: Option<String>,
+    pub tags: Vec<String>,
 }
